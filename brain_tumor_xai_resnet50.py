@@ -30,13 +30,15 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 
 from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing import image
 
 from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 import seaborn as sns
 import cv2
 
@@ -68,7 +70,9 @@ IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 NUM_CLASSES = 4
 EPOCHS = 20
-LEARNING_RATE = 1e-4
+FINE_TUNE_EPOCHS = 15
+LEARNING_RATE = 1e-3
+FINE_TUNE_LEARNING_RATE = 1e-5
 
 MODEL_PATH = "best_resnet50_brain_tumor_model.h5"
 GRADCAM_OUTPUT = "gradcam_overlay.png"
@@ -83,16 +87,16 @@ print("\n[1/5] data_preprocessing section")
 
 # Data augmentation for training
 train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-    rescale=1.0/255.0,  # 0-1 normalization
+    preprocessing_function=preprocess_input,
     validation_split=0.2,
     rotation_range=20,
     zoom_range=0.2,
     horizontal_flip=True
 )
 
-# For validation/test: only preprocessing (normalization via preprocess_input)
+# For validation/test: only preprocessing
 val_test_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
-    rescale=1.0/255.0
+    preprocessing_function=preprocess_input
 )
 
 train_generator = train_datagen.flow_from_directory(
@@ -126,6 +130,16 @@ test_generator = val_test_datagen.flow_from_directory(
 # Class index mapping
 print("Class mapping:", train_generator.class_indices)
 
+# Class weights help improve minority/underperforming class recall.
+class_ids = train_generator.classes
+class_weights_values = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(class_ids),
+    y=class_ids
+)
+class_weights = {i: float(w) for i, w in enumerate(class_weights_values)}
+print("Class weights:", class_weights)
+
 
 # ======================================================
 # 2) model_building section
@@ -155,7 +169,7 @@ model = Model(inputs=base_model.input, outputs=outputs)
 # Compile model
 model.compile(
     optimizer=Adam(learning_rate=LEARNING_RATE),
-    loss='categorical_crossentropy',
+    loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
     metrics=['accuracy']
 )
 
@@ -182,12 +196,47 @@ earlystop_cb = EarlyStopping(
     verbose=1
 )
 
-history = model.fit(
+reduce_lr_cb = ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.2,
+    patience=2,
+    min_lr=1e-7,
+    verbose=1
+)
+
+history_stage1 = model.fit(
     train_generator,
     validation_data=val_generator,
     epochs=EPOCHS,
-    callbacks=[checkpoint_cb, earlystop_cb]
+    callbacks=[checkpoint_cb, earlystop_cb, reduce_lr_cb],
+    class_weight=class_weights
 )
+
+# Fine-tuning stage: unfreeze top layers of ResNet50 for better feature adaptation.
+for layer in base_model.layers[:-30]:
+    layer.trainable = False
+for layer in base_model.layers[-30:]:
+    layer.trainable = True
+
+model.compile(
+    optimizer=Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
+    loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+    metrics=['accuracy']
+)
+
+history_stage2 = model.fit(
+    train_generator,
+    validation_data=val_generator,
+    epochs=EPOCHS + FINE_TUNE_EPOCHS,
+    initial_epoch=history_stage1.epoch[-1] + 1,
+    callbacks=[checkpoint_cb, earlystop_cb, reduce_lr_cb],
+    class_weight=class_weights
+)
+
+# Merge histories for unified plots
+history = {}
+for key in history_stage1.history:
+    history[key] = history_stage1.history[key] + history_stage2.history.get(key, [])
 
 
 # ======================================================
@@ -234,10 +283,10 @@ print("\nClassification Report:")
 print(classification_report(y_true, y_pred, target_names=class_labels_sorted))
 
 # Plot training history
-acc = history.history['accuracy']
-val_acc = history.history['val_accuracy']
-loss = history.history['loss']
-val_loss = history.history['val_loss']
+acc = history['accuracy']
+val_acc = history['val_accuracy']
+loss = history['loss']
+val_loss = history['val_loss']
 epoch_range = range(1, len(acc) + 1)
 
 plt.figure(figsize=(14, 5))
@@ -273,7 +322,7 @@ def get_img_array(img_path, target_size):
     img = image.load_img(img_path, target_size=target_size)
     arr = image.img_to_array(img)
     arr = np.expand_dims(arr, axis=0)
-    arr = arr / 255.0
+    arr = preprocess_input(arr)
     return arr
 
 
