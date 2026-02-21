@@ -69,8 +69,20 @@ if gpus:
 # configuration
 # =========================
 DATASET_DIR = "dataset"
-TRAIN_DIR = os.path.join(DATASET_DIR, "train")
-TEST_DIR = os.path.join(DATASET_DIR, "test")
+# Support both common folder conventions: train/test and Training/Testing.
+if os.path.isdir(os.path.join(DATASET_DIR, "train")) and os.path.isdir(os.path.join(DATASET_DIR, "test")):
+    TRAIN_DIR = os.path.join(DATASET_DIR, "train")
+    TEST_DIR = os.path.join(DATASET_DIR, "test")
+elif os.path.isdir(os.path.join(DATASET_DIR, "Training")) and os.path.isdir(os.path.join(DATASET_DIR, "Testing")):
+    TRAIN_DIR = os.path.join(DATASET_DIR, "Training")
+    TEST_DIR = os.path.join(DATASET_DIR, "Testing")
+else:
+    raise FileNotFoundError(
+        "Could not find dataset folders. Expected either dataset/train+dataset/test or dataset/Training+dataset/Testing"
+    )
+
+if os.path.abspath(TRAIN_DIR) == os.path.abspath(TEST_DIR):
+    raise ValueError("TRAIN_DIR and TEST_DIR point to the same path. Use a separate held-out test set.")
 
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
@@ -81,7 +93,7 @@ LEARNING_RATE = 1e-3
 FINE_TUNE_LEARNING_RATE = 1e-5
 UNFREEZE_LAYERS = 50
 
-MODEL_PATH = "best_resnet50_brain_tumor_model.h5"
+MODEL_PATH = "best_resnet50_brain_tumor_model.keras"
 GRADCAM_OUTPUT = "gradcam_overlay.png"
 
 CLASS_NAMES = ["glioma", "meningioma", "pituitary", "no_tumor"]
@@ -202,7 +214,7 @@ checkpoint_cb = ModelCheckpoint(
 earlystop_cb = EarlyStopping(
     monitor='val_loss',
     patience=5,
-    restore_best_weights=True,
+    restore_best_weights=False,
     verbose=1
 )
 
@@ -256,10 +268,11 @@ for key in history_stage1.history:
 # ======================================================
 print("\n[4/5] evaluation section")
 
-# Load best model if saved
-if os.path.exists(MODEL_PATH):
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print(f"Loaded best model from {MODEL_PATH}")
+# Always load checkpoint-selected best model for reproducible evaluation
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Best checkpoint not found at {MODEL_PATH}. Training may have failed.")
+model = tf.keras.models.load_model(MODEL_PATH)
+print(f"Loaded best model from {MODEL_PATH}")
 
 # Evaluate accuracy on test set
 test_loss, test_acc = model.evaluate(test_generator, verbose=1)
@@ -348,7 +361,9 @@ def make_gradcam_heatmap(img_array, model_obj, last_conv_layer_name, pred_index=
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(img_array)
         if pred_index is None:
-            pred_index = tf.argmax(predictions[0])
+            pred_index = int(tf.argmax(predictions[0]).numpy())
+        else:
+            pred_index = int(pred_index)
         class_channel = predictions[:, pred_index]
 
     grads = tape.gradient(class_channel, conv_outputs)
@@ -358,7 +373,9 @@ def make_gradcam_heatmap(img_array, model_obj, last_conv_layer_name, pred_index=
     heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    heatmap = tf.maximum(heatmap, 0)
+    max_val = tf.math.reduce_max(heatmap)
+    heatmap = heatmap / (max_val + 1e-8)
     return heatmap.numpy()
 
 
@@ -397,8 +414,15 @@ def save_and_display_gradcam(img_path, heatmap, cam_path="gradcam_overlay.png", 
     print(f"Grad-CAM overlay saved at: {cam_path}")
 
 
-# Auto-select last conv layer from ResNet50 backbone
-last_conv_layer_name = "conv5_block3_out"
+# Auto-discover the last Conv2D layer for Grad-CAM robustness
+last_conv_layer_name = None
+for lyr in reversed(model.layers):
+    if isinstance(lyr, tf.keras.layers.Conv2D):
+        last_conv_layer_name = lyr.name
+        break
+if last_conv_layer_name is None:
+    raise ValueError("Could not find a Conv2D layer for Grad-CAM.")
+print("Using Grad-CAM layer:", last_conv_layer_name)
 
 # Example prediction + Grad-CAM on one sample image from test set
 sample_image_path = None
