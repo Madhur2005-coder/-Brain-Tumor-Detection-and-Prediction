@@ -36,6 +36,7 @@ from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, Inpu
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing import image
+from tensorflow.keras import mixed_precision
 
 from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.utils.class_weight import compute_class_weight
@@ -58,6 +59,11 @@ if gpus:
 else:
     print("No GPU found. Running on CPU.")
 
+# Enable mixed precision on GPU for faster Colab training.
+if gpus:
+    mixed_precision.set_global_policy("mixed_float16")
+    print("Mixed precision enabled: mixed_float16")
+
 
 # =========================
 # configuration
@@ -70,9 +76,10 @@ IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 NUM_CLASSES = 4
 EPOCHS = 20
-FINE_TUNE_EPOCHS = 15
+FINE_TUNE_EPOCHS = 20
 LEARNING_RATE = 1e-3
 FINE_TUNE_LEARNING_RATE = 1e-5
+UNFREEZE_LAYERS = 50
 
 MODEL_PATH = "best_resnet50_brain_tumor_model.h5"
 GRADCAM_OUTPUT = "gradcam_overlay.png"
@@ -89,8 +96,11 @@ print("\n[1/5] data_preprocessing section")
 train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
     preprocessing_function=preprocess_input,
     validation_split=0.2,
-    rotation_range=20,
+    rotation_range=25,
     zoom_range=0.2,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    brightness_range=(0.85, 1.15),
     horizontal_flip=True
 )
 
@@ -137,7 +147,7 @@ class_weights_values = compute_class_weight(
     classes=np.unique(class_ids),
     y=class_ids
 )
-class_weights = {i: float(w) for i, w in enumerate(class_weights_values)}
+class_weights = {int(class_id): float(weight) for class_id, weight in zip(np.unique(class_ids), class_weights_values)}
 print("Class weights:", class_weights)
 
 
@@ -162,7 +172,7 @@ x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = Dense(256, activation='relu')(x)
 x = Dropout(0.5)(x)
-outputs = Dense(NUM_CLASSES, activation='softmax')(x)
+outputs = Dense(NUM_CLASSES, activation='softmax', dtype='float32')(x)
 
 model = Model(inputs=base_model.input, outputs=outputs)
 
@@ -170,7 +180,7 @@ model = Model(inputs=base_model.input, outputs=outputs)
 model.compile(
     optimizer=Adam(learning_rate=LEARNING_RATE),
     loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
-    metrics=['accuracy']
+    metrics=['accuracy', tf.keras.metrics.TopKCategoricalAccuracy(k=2, name='top2_accuracy')]
 )
 
 model.summary()
@@ -213,15 +223,17 @@ history_stage1 = model.fit(
 )
 
 # Fine-tuning stage: unfreeze top layers of ResNet50 for better feature adaptation.
-for layer in base_model.layers[:-30]:
+for layer in base_model.layers[:-UNFREEZE_LAYERS]:
     layer.trainable = False
-for layer in base_model.layers[-30:]:
+for layer in base_model.layers[-UNFREEZE_LAYERS:]:
     layer.trainable = True
+
+print(f"Fine-tuning top {UNFREEZE_LAYERS} layers of ResNet50")
 
 model.compile(
     optimizer=Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
     loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
-    metrics=['accuracy']
+    metrics=['accuracy', tf.keras.metrics.TopKCategoricalAccuracy(k=2, name='top2_accuracy')]
 )
 
 history_stage2 = model.fit(
